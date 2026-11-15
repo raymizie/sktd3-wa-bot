@@ -32,6 +32,7 @@ let sock = null;
 let isConnecting = false;
 let reconnectTimer = null;
 let consecutiveFailCount = 0;
+let isPairingRestart = false;
 
 function ensureSessionDir() {
     if (!fs.existsSync(SESSION_DIR)) {
@@ -53,14 +54,19 @@ function clearSessionDir() {
     ensureSessionDir();
 }
 
-function hasCorruptedOrIncompleteSession() {
+function hasStaleCorruptedSession() {
+    if (isPairingRestart) {
+        return false;
+    }
     try {
         const credsPath = path.join(SESSION_DIR, 'creds.json');
         if (!fs.existsSync(credsPath)) return false;
+        const stat = fs.statSync(credsPath);
+        const ageMs = Date.now() - stat.mtimeMs;
         const raw = fs.readFileSync(credsPath, 'utf8');
         const creds = JSON.parse(raw);
-        // Jika creds.json ada 'me' tetapi 'registered' masih false, atau fail rosak, sesi tersekat dan takkan jana QR
-        if (creds && creds.registered === false && creds.me) {
+        // Hanya padam jika sesi separuh jalan (registered=false tetapi ada me) sudah basi (> 90 saat)
+        if (creds && creds.registered === false && creds.me && ageMs > 90000) {
             return true;
         }
         return false;
@@ -96,14 +102,21 @@ async function startWhatsAppBot() {
     }
 
     ensureSessionDir();
-    if (hasCorruptedOrIncompleteSession()) {
+    if (hasStaleCorruptedSession()) {
         clearSessionDir();
     }
+    isPairingRestart = false;
 
     botState.status = 'connecting';
     botState.updated_at = new Date().toISOString();
 
     try {
+        if (sock && sock.ev) {
+            try {
+                sock.ev.removeAllListeners();
+            } catch (_e) {}
+        }
+
         const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
         let version = [2, 3000, 1015901307];
         try {
@@ -120,7 +133,7 @@ async function startWhatsAppBot() {
             auth: state,
             printQRInTerminal: false,
             logger: pino({ level: 'silent' }),
-            browser: ['Sistem Relief SKTD3', 'Chrome', '120.0.0'],
+            browser: Browsers.ubuntu('Chrome'),
             syncFullHistory: false,
             markOnlineOnConnect: false,
             connectTimeoutMs: 30000
@@ -154,6 +167,7 @@ async function startWhatsAppBot() {
 
             if (connection === 'open') {
                 consecutiveFailCount = 0;
+                isPairingRestart = false;
                 botState.status = 'connected';
                 botState.qr_data_url = null;
                 botState.last_error = null;
@@ -169,6 +183,20 @@ async function startWhatsAppBot() {
 
             if (connection === 'close') {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const isRestartRequired = statusCode === DisconnectReason.restartRequired || statusCode === 515;
+
+                if (isRestartRequired) {
+                    // Selepas imbas QR, WhatsApp meminta sambungan semula (515) untuk melengkapkan pendaftaran
+                    isPairingRestart = true;
+                    consecutiveFailCount = 0;
+                    botState.status = 'connecting';
+                    botState.updated_at = new Date().toISOString();
+                    reconnectTimer = setTimeout(() => {
+                        startWhatsAppBot();
+                    }, 250);
+                    return;
+                }
+
                 const invalidSessionCodes = [
                     DisconnectReason.loggedOut,
                     DisconnectReason.badSession,
@@ -177,7 +205,7 @@ async function startWhatsAppBot() {
                     401, 403, 405, 411, 500
                 ];
                 consecutiveFailCount++;
-                const shouldResetSession = invalidSessionCodes.includes(statusCode) || consecutiveFailCount >= 2;
+                const shouldResetSession = invalidSessionCodes.includes(statusCode) || consecutiveFailCount >= 3;
 
                 botState.qr_data_url = null;
                 botState.user = null;
@@ -255,7 +283,7 @@ const server = http.createServer(async (req, res) => {
         });
     }
 
-    if (req.method === 'POST' && pathname === '/send') {
+    if (req.method === 'POST' && (pathname === '/send' || pathname === '/')) {
         const body = await readJsonBody(req);
         const rawPhone = body.phone || body.target || body.to || '';
         const text = String(body.message || body.text || '').trim();
