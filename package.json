@@ -1,0 +1,12 @@
+{
+  "name": "relief-wa-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Servis Bot WhatsApp Scan QR Terbina Dalam untuk Sistem Pengurusan Relief",
+  "main": "server.js",
+  "dependencies": {
+    "@whiskeysockets/baileys": "6.5.0",
+    "pino": "^8.19.0",
+    "qrcode": "^1.5.3"
+  }
+}
